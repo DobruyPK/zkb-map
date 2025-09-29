@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#060606" />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <link rel="stylesheet" href="%PUBLIC_URL%/normalize.css" />
+    <title>ZKB-Map</title>
+    <style>
+      #zkb-map-root {
+        height: 100vh;
+        background: #060606;
+        overflow: hidden;
+        position: relative;
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div
+      id="zkb-map-root"
+      data-websocket-url="wss://zkillboard.com/websocket/"
+      data-universe-url="%PUBLIC_URL%/data/universe.json"
+    />
+  </body>
+</html>
