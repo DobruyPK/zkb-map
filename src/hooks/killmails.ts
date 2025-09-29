@@ -1,3 +1,4 @@
+// killmails.ts (или где твой хук живёт)
 import differenceInMilliseconds from 'date-fns/differenceInMilliseconds'
 import { useCallback, useEffect, useState } from 'react'
 import pickBy from 'lodash/pickBy'
@@ -9,29 +10,18 @@ import uniqueId from 'lodash/uniqueId'
 
 export const normalKillmailAgeMs = 45 * 1000
 const trimIntervalMs = 5 * 1000
-const normalCloseCode = 1000
-const reconnectIntervalMs = trimIntervalMs
 
-type WebsocketStatusMessage = {
-  action: 'tqStatus'
-  tqStatus: string
-  tqCount: string
-  kills: string
-}
-
-type WebsocketKillmail = {
-  killmail_id: number
-  killmail_time: string
-  solar_system_id: number
-  victim: {
-    alliance_id?: number
-    character_id: number
-    corporation_id: number
-    ship_type_id: number
-    position: {
-      x: number,
-      y: number,
-      z: number
+type RedisQPackage = {
+  killmail: {
+    killmail_id: number
+    killmail_time: string
+    solar_system_id: number
+    victim: {
+      alliance_id?: number
+      character_id: number
+      corporation_id: number
+      ship_type_id: number
+      position?: { x: number, y: number, z: number }
     }
   }
   zkb: {
@@ -45,7 +35,19 @@ type WebsocketKillmail = {
   }
 }
 
-type WebsocketMessage = WebsocketKillmail | WebsocketStatusMessage
+type Killmail = {
+  id: number
+  time: Date
+  receivedAt: Date
+  characterId: number
+  corporationId: number
+  allianceId?: number
+  shipTypeId: number
+  solarSystemId: number
+  url: string
+  totalValue: number
+  scaledValue: number
+}
 
 type State = {
   killmails: Record<string, Killmail>,
@@ -56,21 +58,16 @@ type State = {
   unfocus: (id: Killmail['id']) => void
 }
 
-const shouldKeep = (now: Date, killmail: Killmail) => {
-  const { scaledValue, receivedAt } = killmail
-  const age = differenceInMilliseconds(now, receivedAt)
-  return age < normalKillmailAgeMs * scaledValue
-}
+const shouldKeep = (now: Date, k: Killmail) =>
+  differenceInMilliseconds(now, k.receivedAt) < normalKillmailAgeMs * k.scaledValue
 
-const subscribeMessage = (channel: string) => JSON.stringify({
-  "action": "sub",
-  "channel": channel
-})
+const parseKillmail = (raw: RedisQPackage | any): Killmail => {
+  // Поддержим и старый формат "плоского" объекта, и redisq.package
+  const km = 'killmail' in raw ? raw.killmail : raw
+  const zkb = 'zkb' in raw ? raw.zkb : undefined
 
-const parseKillmail = (raw: WebsocketKillmail): Killmail => {
-  const { killmail_id, killmail_time, victim, solar_system_id, zkb } = raw
+  const { killmail_id, killmail_time, victim, solar_system_id } = km
   const { character_id, corporation_id, alliance_id, ship_type_id } = victim
-  const { url, totalValue } = zkb
   const time = parseISO(killmail_time)
 
   return {
@@ -82,36 +79,60 @@ const parseKillmail = (raw: WebsocketKillmail): Killmail => {
     allianceId: alliance_id,
     shipTypeId: ship_type_id,
     solarSystemId: solar_system_id,
-    url,
-    totalValue,
-    scaledValue: scaleValue(totalValue)
+    url: zkb?.url ?? `https://zkillboard.com/kill/${killmail_id}/`,
+    totalValue: zkb?.totalValue ?? 0,
+    scaledValue: scaleValue(zkb?.totalValue ?? 0),
   }
 }
 
 export const useKillmails = create<State>(set => ({
   killmails: {},
   focused: undefined,
-  receiveKillmail: (killmail) => { set(state => ({ killmails: { ...state.killmails, [killmail.id]: killmail } })) },
+  receiveKillmail: (killmail) => { set(s => ({ killmails: { ...s.killmails, [killmail.id]: killmail } })) },
   trimKillmails: () => {
-    const shouldKeepNow = shouldKeep.bind(undefined, new Date())
-    set(state => {
-      const killmails = pickBy(state.killmails, shouldKeepNow)
+    const keep = shouldKeep.bind(undefined, new Date())
+    set(s => {
+      const killmails = pickBy(s.killmails, keep)
       const changes: Partial<State> = { killmails }
-      if (state.focused && !killmails[state.focused.id]) {
-        changes.focused = undefined
-      }
+      if (s.focused && !killmails[s.focused.id]) changes.focused = undefined
       return changes
     })
   },
-  focus: (id) => { set(state => ({ focused: state.killmails[id] })) },
-  unfocus: (id) => { set(state => state.focused && state.focused.id === id ? { focused: undefined } : {}) }
+  focus: (id) => { set(s => ({ focused: s.killmails[id] })) },
+  unfocus: (id) => { set(s => s.focused && s.focused.id === id ? { focused: undefined } : {}) }
 }))
 
-export const useKillmailMonitor = (sourceUrl: string): void => {
+// ---------- НОВОЕ: Long-poll RedisQ вместо WS ----------
+const REDISQ_BASE = 'https://zkillredisq.stream/listen.php'
+const QKEY = 'zkbQueueId'
+function getQueueId() {
+  let q = localStorage.getItem(QKEY)
+  if (!q) { q = 'zkbmap-' + Math.random().toString(36).slice(2); localStorage.setItem(QKEY, q) }
+  return q
+}
+
+// простой long-poll цикл с follow-redirect (fetch делает автоматом)
+async function pollRedisQ(onKill: (pkg: RedisQPackage) => void, onTick: () => void, signal: AbortSignal) {
+  const queueID = getQueueId()
+  while (!signal.aborted) {
+    try {
+      const url = `${REDISQ_BASE}?queueID=${encodeURIComponent(queueID)}&ttw=10`
+      const res = await fetch(url, { redirect: 'follow', cache: 'no-store' })
+      if (!res.ok) { await new Promise(r => setTimeout(r, 1000)); continue }
+      const data = await res.json() as { package: RedisQPackage | null }
+      if (data?.package) onKill(data.package)
+      else onTick() // heartbeat, чтобы UI «жил»
+    } catch {
+      await new Promise(r => setTimeout(r, 1000)) // сеть/429 → пауза
+    }
+  }
+}
+
+export const useKillmailMonitor = (sourceUrl?: string): void => {
   const receivePing = useConnection(useCallback(state => state.receivePing, []))
   const trimKillmails = useKillmails(useCallback(state => state.trimKillmails, []))
   const receiveKillmail = useKillmails(useCallback(state => state.receiveKillmail, []))
-  const [connectionRequest, setConnectionRequest] = useState(uniqueId(sourceUrl))
+  const [nonce] = useState(() => uniqueId('redisq'))
 
   useEffect(() => {
     const interval = setInterval(trimKillmails, trimIntervalMs)
@@ -119,34 +140,12 @@ export const useKillmailMonitor = (sourceUrl: string): void => {
   }, [trimKillmails])
 
   useEffect(() => {
-    const connection = new WebSocket(sourceUrl)
-
-    connection.onopen = () => {
-      connection.send(subscribeMessage('killstream'))
-      connection.send(subscribeMessage('public'))
-    }
-
-    connection.onmessage = (e) => {
-      const parsed: WebsocketMessage = JSON.parse(e.data)
-
-      if ('killmail_id' in parsed) {
-        receiveKillmail(parseKillmail(parsed))
-      } else if ('tqStatus' in parsed) {
-        receivePing()
-      } else {
-        console.error(parsed)
-      }
-    }
-
-    connection.onclose = ({ code }) => {
-      if (code !== normalCloseCode) {
-        // unless the connection was closed by hook exiting, trigger reconnect by resetting effect param
-        setTimeout(() => {
-          setConnectionRequest(uniqueId(sourceUrl))
-        }, reconnectIntervalMs)
-      }
-    }
-
-    return () => connection.close(normalCloseCode)
-  }, [sourceUrl, receiveKillmail, receivePing, connectionRequest])
+    const ac = new AbortController()
+    pollRedisQ(
+      (pkg) => { receiveKillmail(parseKillmail(pkg)); receivePing() },
+      () => receivePing(),
+      ac.signal
+    )
+    return () => ac.abort()
+  }, [receiveKillmail, receivePing, nonce])
 }
